@@ -178,10 +178,30 @@ func cleanLog(raw string) string {
 func str(m map[string]any, key string) string { v, _ := m[key].(string); return v }
 func num(m map[string]any, key string) float64 { v, _ := m[key].(float64); return v }
 
-func pipelineSummary(p map[string]any) map[string]any {
+func shortTime(iso string) string {
+	t, err := time.Parse(time.RFC3339, iso)
+	if err != nil {
+		t, err = time.Parse("2006-01-02T15:04:05.000Z", iso)
+		if err != nil {
+			return iso
+		}
+	}
+	return t.Format("02 Jan 15:04")
+}
+
+func pipelineSummary(p map[string]any, compact bool) map[string]any {
 	sha := str(p, "sha")
 	if len(sha) > 8 {
 		sha = sha[:8]
+	}
+	if compact {
+		return map[string]any{
+			"id":       num(p, "id"),
+			"status":   str(p, "status"),
+			"ref":      str(p, "ref"),
+			"duration": formatDuration(p["duration"]),
+			"created":  shortTime(str(p, "created_at")),
+		}
 	}
 	return map[string]any{
 		"id":         num(p, "id"),
@@ -196,7 +216,20 @@ func pipelineSummary(p map[string]any) map[string]any {
 	}
 }
 
-func jobSummary(j map[string]any) map[string]any {
+func jobSummary(j map[string]any, compact bool) map[string]any {
+	if compact {
+		m := map[string]any{
+			"id":       num(j, "id"),
+			"name":     str(j, "name"),
+			"stage":    str(j, "stage"),
+			"status":   str(j, "status"),
+			"duration": formatDuration(j["duration"]),
+		}
+		if fr := j["failure_reason"]; fr != nil {
+			m["failure_reason"] = fr
+		}
+		return m
+	}
 	runnerDesc := ""
 	if r, ok := j["runner"].(map[string]any); ok {
 		runnerDesc = str(r, "description")
@@ -215,7 +248,7 @@ func jobSummary(j map[string]any) map[string]any {
 	}
 }
 
-func getFailedJobs(pid string, pipelineID int) []map[string]any {
+func getFailedJobs(pid string, pipelineID int, compact bool) []map[string]any {
 	raw, err := glJSON("GET", fmt.Sprintf("/projects/%s/pipelines/%d/jobs?per_page=100&scope[]=failed", pid, pipelineID))
 	if err != nil {
 		return nil
@@ -227,7 +260,7 @@ func getFailedJobs(pid string, pipelineID int) []map[string]any {
 	var result []map[string]any
 	for _, j := range jobs {
 		if m, ok := j.(map[string]any); ok {
-			result = append(result, jobSummary(m))
+			result = append(result, jobSummary(m, compact))
 		}
 	}
 	return result
@@ -244,6 +277,7 @@ func getArgs(r mcp.CallToolRequest) map[string]any {
 }
 
 func sarg(r mcp.CallToolRequest, k string) string { v, _ := getArgs(r)[k].(string); return v }
+func isCompact(r mcp.CallToolRequest) bool { return sarg(r, "format") == "compact" }
 
 func iarg(r mcp.CallToolRequest, k string, def int) int {
 	v, ok := getArgs(r)[k].(float64)
@@ -272,9 +306,10 @@ func registerTools(s *server.MCPServer) {
 	// ── MR → Pipelines ──
 
 	s.AddTool(mcp.NewTool("mr_pipelines",
-		mcp.WithDescription("Get all pipelines for a merge request. Start here when investigating MR CI status. Returns pipelines newest-first. Only merge_request_event pipelines shown. The latest failed pipeline auto-expands its failed jobs."),
+		mcp.WithDescription("Get all pipelines for a merge request. Start here when investigating MR CI status. Returns pipelines newest-first. Only merge_request_event pipelines shown. The latest failed pipeline auto-expands its failed jobs. Use format=compact for minimal output."),
 		mcp.WithNumber("mr_iid", mcp.Required(), mcp.Description("Merge request IID")),
 		mcp.WithString("project_id", mcp.Description("GitLab project ID (default: GITLAB_DEFAULT_PROJECT_ID env)")),
+		mcp.WithString("format", mcp.Description("Response format: full (default) or compact")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		mrIID := iarg(req, "mr_iid", 0)
 		if mrIID == 0 {
@@ -284,6 +319,7 @@ func registerTools(s *server.MCPServer) {
 		if err != nil {
 			return fail(err.Error())
 		}
+		compact := isCompact(req)
 
 		raw, err := glJSON("GET", fmt.Sprintf("/projects/%s/merge_requests/%d/pipelines", pid, mrIID))
 		if err != nil {
@@ -301,9 +337,13 @@ func registerTools(s *server.MCPServer) {
 			if str(pm, "source") != "merge_request_event" {
 				continue
 			}
-			summary := pipelineSummary(pm)
+			// compact: только failed + самый свежий
+			if compact && str(pm, "status") != "failed" && len(result) > 0 {
+				continue
+			}
+			summary := pipelineSummary(pm, compact)
 			if str(pm, "status") == "failed" && !firstFailedExpanded {
-				summary["failed_jobs"] = getFailedJobs(pid, int(num(pm, "id")))
+				summary["failed_jobs"] = getFailedJobs(pid, int(num(pm, "id")), compact)
 				firstFailedExpanded = true
 			}
 			result = append(result, summary)
@@ -320,9 +360,10 @@ func registerTools(s *server.MCPServer) {
 	// ── Pipeline Jobs ──
 
 	s.AddTool(mcp.NewTool("pipeline_jobs",
-		mcp.WithDescription("Get all jobs for a pipeline, grouped by stage. Use after mr_pipelines to drill into a specific pipeline."),
+		mcp.WithDescription("Get all jobs for a pipeline, grouped by stage. Use after mr_pipelines to drill into a specific pipeline. Use format=compact for minimal output."),
 		mcp.WithNumber("pipeline_id", mcp.Required(), mcp.Description("Pipeline ID")),
 		mcp.WithString("project_id", mcp.Description("GitLab project ID (default: GITLAB_DEFAULT_PROJECT_ID env)")),
+		mcp.WithString("format", mcp.Description("Response format: full (default) or compact")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		pipelineID := iarg(req, "pipeline_id", 0)
 		if pipelineID == 0 {
@@ -332,6 +373,7 @@ func registerTools(s *server.MCPServer) {
 		if err != nil {
 			return fail(err.Error())
 		}
+		compact := isCompact(req)
 
 		raw, err := glJSON("GET", fmt.Sprintf("/projects/%s/pipelines/%d/jobs?per_page=100", pid, pipelineID))
 		if err != nil {
@@ -346,7 +388,7 @@ func registerTools(s *server.MCPServer) {
 			if !ok {
 				continue
 			}
-			summary := jobSummary(jm)
+			summary := jobSummary(jm, compact)
 			stage := str(jm, "stage")
 			byStage[stage] = append(byStage[stage], summary)
 			if str(jm, "status") == "failed" {
@@ -388,7 +430,7 @@ func registerTools(s *server.MCPServer) {
 			return fail(err.Error())
 		}
 		meta, _ := metaRaw.(map[string]any)
-		job := jobSummary(meta)
+		job := jobSummary(meta, false)
 
 		// Получаем лог (может быть недоступен)
 		rawLog, err := glText("GET", fmt.Sprintf("/projects/%s/jobs/%d/trace", pid, jobID))
@@ -462,7 +504,7 @@ func registerTools(s *server.MCPServer) {
 
 		return res(map[string]any{
 			"action":   "pipeline_retried",
-			"pipeline": pipelineSummary(p),
+			"pipeline": pipelineSummary(p, false),
 		})
 	})
 
@@ -490,7 +532,7 @@ func registerTools(s *server.MCPServer) {
 
 		return res(map[string]any{
 			"action": "job_retried",
-			"job":    jobSummary(j),
+			"job":    jobSummary(j, false),
 		})
 	})
 
@@ -518,7 +560,7 @@ func registerTools(s *server.MCPServer) {
 
 		return res(map[string]any{
 			"action":   "pipeline_cancelled",
-			"pipeline": pipelineSummary(p),
+			"pipeline": pipelineSummary(p, false),
 		})
 	})
 }
